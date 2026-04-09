@@ -1,0 +1,75 @@
+# (SHORTENED FOR READABILITY — THIS IS CORE STRUCTURE)
+
+import pygame, cv2, time, math
+import RPi.GPIO as GPIO
+from OpenGL.GL import *
+from OpenGL.GLU import *
+
+# --- CAMERA ---
+cap = cv2.VideoCapture(0)
+
+# --- AI MODEL ---
+net = cv2.dnn.readNetFromCaffe(
+    "MobileNetSSD_deploy.prototxt",
+    "MobileNetSSD_deploy.caffemodel"
+)
+
+# --- GPIO SETUP ---
+GPIO.setmode(GPIO.BCM)
+TRIG_F, ECHO_F = 23, 24
+TRIG_R, ECHO_R = 5, 6
+BUZZER = 18
+
+GPIO.setup([TRIG_F, TRIG_R], GPIO.OUT)
+GPIO.setup([ECHO_F, ECHO_R], GPIO.IN)
+GPIO.setup(BUZZER, GPIO.OUT)
+
+# --- DISTANCE FUNCTION ---
+def distance(trig, echo):
+    GPIO.output(trig, True)
+    time.sleep(0.00001)
+    GPIO.output(trig, False)
+
+    while GPIO.input(echo) == 0:
+        start = time.time()
+    while GPIO.input(echo) == 1:
+        stop = time.time()
+
+    return (stop - start) * 34300 / 2
+
+# --- AI DETECTION ---
+def detect(frame):
+    h, w = frame.shape[:2]
+    blob = cv2.dnn.blobFromImage(frame, 0.0078, (300,300), 127.5)
+    net.setInput(blob)
+    detections = net.forward()
+
+    objects = []
+    for i in range(detections.shape[2]):
+        conf = detections[0,0,i,2]
+        if conf > 0.5:
+            idx = int(detections[0,0,i,1])
+            label = idx
+            objects.append(label)
+    return objects
+
+# --- PYGAME ---
+pygame.init()
+screen = pygame.display.set_mode((800,480))
+
+# --- LOOP ---
+while True:
+    ret, frame = cap.read()
+    if ret:
+        objs = detect(frame)
+
+    front = distance(TRIG_F, ECHO_F)
+    rear = distance(TRIG_R, ECHO_R)
+
+    # Warning logic
+    if front < 40 or rear < 40:
+        GPIO.output(BUZZER, True)
+    else:
+        GPIO.output(BUZZER, False)
+
+    pygame.display.flip()
