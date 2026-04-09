@@ -1,0 +1,3 @@
+sudo apt update
+sudo apt install python3-pip python3-pygame python3-opengl python3-opencv
+pip3 install numpy adafruit-circuitpython-ina219
