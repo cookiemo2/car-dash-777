@@ -1,0 +1,219 @@
+import pygame, cv2, time, math
+import RPi.GPIO as GPIO
+from pygame.locals import *
+from OpenGL.GL import *
+from OpenGL.GLU import *
+import smbus
+import board, busio
+from adafruit_ina219 import INA219
+
+# ---------------- GPIO ----------------
+GPIO.setmode(GPIO.BCM)
+
+# Hall sensor
+HALL = 17
+GPIO.setup(HALL, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+pulses = 0
+def pulse(channel):
+    global pulses
+    pulses += 1
+GPIO.add_event_detect(HALL, GPIO.FALLING, callback=pulse)
+
+# Ultrasonic
+TRIG_F, ECHO_F = 23, 24
+TRIG_R, ECHO_R = 5, 6
+GPIO.setup(TRIG_F, GPIO.OUT)
+GPIO.setup(ECHO_F, GPIO.IN)
+GPIO.setup(TRIG_R, GPIO.OUT)
+GPIO.setup(ECHO_R, GPIO.IN)
+
+# Buzzer
+BUZZER = 18
+GPIO.setup(BUZZER, GPIO.OUT)
+
+# ---------------- MPU6050 ----------------
+bus = smbus.SMBus(1)
+MPU = 0x68
+bus.write_byte_data(MPU, 0x6B, 0)
+
+def read_word(reg):
+    h = bus.read_byte_data(MPU, reg)
+    l = bus.read_byte_data(MPU, reg+1)
+    val = (h << 8) + l
+    return val - 65536 if val > 32767 else val
+
+# ---------------- BATTERY ----------------
+i2c = busio.I2C(board.SCL, board.SDA)
+ina = INA219(i2c)
+def battery_percent():
+    v = ina.bus_voltage + ina.shunt_voltage
+    return max(0, min(100, int((v-22)/(29.2-22)*100)))
+
+# ---------------- CAMERA ----------------
+cap = cv2.VideoCapture(0)
+
+# ---------------- FUNCTIONS ----------------
+def distance(trig, echo):
+    GPIO.output(trig, False)
+    time.sleep(0.05)
+
+    GPIO.output(trig, True)
+    time.sleep(0.00001)
+    GPIO.output(trig, False)
+
+    timeout = time.time()
+    start = stop = timeout
+
+    while GPIO.input(echo) == 0:
+        start = time.time()
+        if start - timeout > 0.02:
+            return 999
+
+    while GPIO.input(echo) == 1:
+        stop = time.time()
+        if stop - start > 0.02:
+            return 999
+
+    return (stop - start) * 34300 / 2
+
+def get_position(frame):
+    h, w, _ = frame.shape
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray, (5,5), 0)
+    _, thresh = cv2.threshold(blur, 60, 255, cv2.THRESH_BINARY)
+    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return None
+    biggest = max(contours, key=cv2.contourArea)
+    x, y, w_box, h_box = cv2.boundingRect(biggest)
+    center_x = x + w_box // 2
+    if center_x < w * 0.33:
+        return "LEFT"
+    elif center_x < w * 0.66:
+        return "CENTER"
+    else:
+        return "RIGHT"
+
+last_beep = 0
+def buzzer_control(dist):
+    global last_beep
+    now = time.time()
+    if dist > 100:
+        GPIO.output(BUZZER, False)
+    elif dist > 60:
+        if now - last_beep > 0.7:
+            GPIO.output(BUZZER, True)
+            last_beep = now
+        else:
+            GPIO.output(BUZZER, False)
+    elif dist > 30:
+        if now - last_beep > 0.3:
+            GPIO.output(BUZZER, True)
+            last_beep = now
+        else:
+            GPIO.output(BUZZER, False)
+    else:
+        GPIO.output(BUZZER, True)
+
+def draw_text(text, font, x, y):
+    surf = font.render(text, True, (0,255,255))
+    data = pygame.image.tostring(surf, "RGBA", True)
+    glWindowPos2d(x, y)
+    glDrawPixels(surf.get_width(), surf.get_height(), GL_RGBA, GL_UNSIGNED_BYTE, data)
+
+def draw_car():
+    glBegin(GL_QUADS)
+    glColor3f(0,1,1)
+    glVertex3f(-1,0.3,-2)
+    glVertex3f(1,0.3,-2)
+    glVertex3f(1,0.3,2)
+    glVertex3f(-1,0.3,2)
+    glEnd()
+
+def radar_zone(dist, z):
+    if dist > 120:
+        return
+    if dist > 80:
+        color = (0,1,0,0.3)
+    elif dist > 50:
+        color = (1,1,0,0.4)
+    elif dist > 30:
+        color = (1,0.5,0,0.5)
+    else:
+        color = (1,0,0,0.7)
+    scale = max(0.2, min(1.0, dist/120))
+    glColor4f(*color)
+    glBegin(GL_QUADS)
+    glVertex3f(-1.2*scale,0.01,z)
+    glVertex3f(1.2*scale,0.01,z)
+    glVertex3f(1.2*scale,0.01,z+(0.5 if z>0 else -0.5))
+    glVertex3f(-1.2*scale,0.01,z+(0.5 if z>0 else -0.5))
+    glEnd()
+
+# ---------------- DISPLAY ----------------
+pygame.init()
+WIDTH, HEIGHT = 800, 480
+pygame.display.set_mode((WIDTH, HEIGHT), DOUBLEBUF | OPENGL)
+gluPerspective(45, WIDTH/HEIGHT, 0.1, 50)
+glTranslatef(-1.5, -0.6, -6)
+
+font_big = pygame.font.SysFont("Arial", 48, True)
+font_mid = pygame.font.SysFont("Arial", 28)
+
+clock = pygame.time.Clock()
+roll = pitch = 0
+miles = 0
+
+# ---------------- LOOP ----------------
+while True:
+    dt = clock.tick(60)/1000
+    for e in pygame.event.get():
+        if e.type == QUIT:
+            GPIO.cleanup()
+            cap.release()
+            quit()
+
+    # ---- CAMERA ----
+    ret, frame = cap.read()
+    position = get_position(frame) if ret else None
+
+    # ---- SENSORS ----
+    front = distance(TRIG_F, ECHO_F)
+    rear = distance(TRIG_R, ECHO_R)
+
+    # ---- SPEED ----
+    speed = pulses * 1.117 / dt * 2.237
+    pulses = 0
+    miles += speed * dt / 3600
+
+    # ---- GYRO ----
+    gx = read_word(0x43)/131
+    gy = read_word(0x45)/131
+    roll += (gx-roll)*0.1
+    pitch += (gy-pitch)*0.1
+
+    # ---- BUZZER ----
+    buzzer_control(min(front, rear))
+
+    # ---- DRAW ----
+    glClear(GL_COLOR_BUFFER_BIT|GL_DEPTH_BUFFER_BIT)
+    glPushMatrix()
+    glRotatef(roll,0,0,1)
+    glRotatef(pitch,1,0,0)
+    draw_car()
+    radar_zone(front, 2.2)
+    radar_zone(rear, -2.2)
+    glPopMatrix()
+    glDisable(GL_DEPTH_TEST)
+
+    draw_text(f"{int(speed)} MPH", font_big, 420, 300)
+    draw_text(f"Miles {miles:.1f}", font_mid, 420, 260)
+    draw_text(f"BAT {battery_percent()}%", font_mid, 320, 450)
+
+    if front < 60:
+        draw_text(f"FRONT {position or ''} {int(front)}cm", font_mid, 50, 400)
+    if rear < 60:
+        draw_text(f"REAR {position or ''} {int(rear)}cm", font_mid, 50, 360)
+
+    glEnable(GL_DEPTH_TEST)
+    pygame.display.flip()
