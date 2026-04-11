@@ -4,6 +4,7 @@ from OpenGL.GL import *
 from OpenGL.GLU import *
 import math
 import time
+import collections
 import smbus
 import RPi.GPIO as GPIO
 import board, busio
@@ -61,7 +62,11 @@ SENSOR_PIN = 17
 GPIO.setmode(GPIO.BCM)
 GPIO.setup(SENSOR_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP)
 pulses = 0
-WHEEL_CIRCUMFERENCE = 1.117  # meters (14in wheel)
+WHEEL_CIRCUMFERENCE = 1.117  # meters (14-inch wheel diameter)
+MAGNETS_PER_ROTATION = 1      # number of magnets on the wheel
+MPS_TO_MPH = 2.23694           # conversion factor: meters/sec -> MPH
+SPEED_WINDOW_SIZE = 10         # number of frames for moving-average smoothing
+speed_history = collections.deque(maxlen=SPEED_WINDOW_SIZE)
 
 def pulse(channel):
     global pulses
@@ -147,9 +152,11 @@ while running:
     roll += (target_roll - roll) * 0.1
     pitch += (target_pitch - pitch) * 0.1
 
-    # Speed & miles
-    rotations = pulses / 1.0  # 1 pulse per rotation
-    speed = (rotations * WHEEL_CIRCUMFERENCE) / dt * 3.6  # km/h
+    # Speed & miles (calibrated)
+    rotations = pulses / MAGNETS_PER_ROTATION
+    instant_speed = (rotations * WHEEL_CIRCUMFERENCE) / dt * MPS_TO_MPH  # MPH
+    speed_history.append(instant_speed)
+    speed = sum(speed_history) / len(speed_history)  # smoothed MPH
     miles += speed * dt / 3600
     pulses = 0
 
